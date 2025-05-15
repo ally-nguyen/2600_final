@@ -285,7 +285,11 @@ void on_message(struct mosquitto *mosq, void *userdata, const struct mosquitto_m
             move_cursor(status_row + 3, 1);
             printf("\033[K");
             printf("Game over: %s\n", payload);
-            fflush(stdout);
+            move_cursor(status_row + 5, 1);
+            printf("Return to main menu? (M/N): ");
+            char menu_response = getchar();
+            while (getchar() != '\n')
+                ;
             game_over = 0;
         }
     }
