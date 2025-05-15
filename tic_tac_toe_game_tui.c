@@ -1,16 +1,17 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
-#include <mosquitto.h>
-#include <ctype.h>
-#include <signal.h>
-#include <sys/wait.h>
+#include <unistd.h>    // For usleep
+#include <mosquitto.h> // Assuming you have libmosquitto installed
+#include <ctype.h>     // for tolower()
+#include <signal.h>    // For handling signals (cleaning up child process)
+#include <sys/wait.h>  // For waitpid
+#include <time.h>      // Add this line
 
-// MQTT Broker and topics made
+// MQTT Broker details (match your Arduino code)
 const char *mqtt_host = "34.19.95.21";
 int mqtt_port = 1883;
-const char *mqtt_client_id = "tictactoe_tui_x";
+char mqtt_client_id[50]; // Will be set dynamically based on player role
 const char *subscribe_topic_board = "tic_tac_toe/board_state";
 const char *subscribe_topic_turn = "tic_tac_toe/turn";
 const char *subscribe_topic_status = "tic_tac_toe/game_status";
@@ -18,19 +19,22 @@ const char *publish_topic_move = "move_request";
 const char *subscribe_topic_o_move = "move_response";
 const char *game_mode_Topic = "game_mode";
 const char *subscribe_topic_tournament_results = "tournament_results";
+
+// New topics for two-player mode
 const char *publish_topic_player1_move = "player1_move";
 const char *publish_topic_player2_move = "player2_move";
 
 char board[3][3] = {{' ', ' ', ' '}, {' ', ' ', ' '}, {' ', ' ', ' '}};
-char current_player = ' ';
+char current_player = ' '; // Will be updated based on game mode
+char my_player = ' ';      // 'X' or 'O' for this terminal instance
 struct mosquitto *mosq = NULL;
 int initial_state_received = 0;
 int game_over = 0;
-char winner = ' ';
-int status_row = 10;
-int game_mode = 0;
+char winner = ' ';   // 'X', 'O', or 'D' for draw
+int status_row = 10; // Row for status messages
+int game_mode = 0;   // 0: not selected, 1: single player, 2: two player
 pid_t bash_player_pid = 0;
-int waiting_for_esp32_response = 0;
+int waiting_for_esp32_response = 0; // New flag to track if we're waiting for ESP32
 
 void reset_game()
 {
@@ -39,7 +43,7 @@ void reset_game()
             board[i][j] = ' ';
     winner = ' ';
     game_over = 0;
-    current_player = 'X';
+    current_player = 'X'; // Default to X for new games
     waiting_for_esp32_response = 0;
 }
 
@@ -124,7 +128,6 @@ int get_move(int player, int prompt_row, int error_row)
     }
 }
 
-// subscribes to necessary topics
 void on_connect(struct mosquitto *mosq, void *userdata, int res)
 {
     if (res == MOSQ_ERR_SUCCESS)
@@ -133,6 +136,7 @@ void on_connect(struct mosquitto *mosq, void *userdata, int res)
         printf("\033[K");
         printf("Connected to MQTT broker\n");
 
+        // Subscribe to topics needed for both game modes
         mosquitto_subscribe(mosq, NULL, subscribe_topic_board, 1);
         mosquitto_subscribe(mosq, NULL, subscribe_topic_turn, 1);
         mosquitto_subscribe(mosq, NULL, subscribe_topic_status, 1);
@@ -140,8 +144,11 @@ void on_connect(struct mosquitto *mosq, void *userdata, int res)
 
         if (game_mode == 1)
         {
+            // Single player mode - subscribe to AI moves
             mosquitto_subscribe(mosq, NULL, subscribe_topic_o_move, 1);
         }
+
+        // Request the initial board state from ESP32
         mosquitto_publish(mosq, NULL, "request_state", 0, NULL, 0, false);
     }
     else
@@ -152,7 +159,6 @@ void on_connect(struct mosquitto *mosq, void *userdata, int res)
     }
 }
 
-// process feedback from esp32 to display on TUI board
 void on_message(struct mosquitto *mosq, void *userdata, const struct mosquitto_message *msg)
 {
     if (strcmp(msg->topic, subscribe_topic_board) == 0)
@@ -180,9 +186,8 @@ void on_message(struct mosquitto *mosq, void *userdata, const struct mosquitto_m
         }
         display_board();
         initial_state_received = 1;
-        waiting_for_esp32_response = 0;
+        waiting_for_esp32_response = 0; // Reset waiting flag since we got board update
     }
-    // handles player O moves to display move
     else if (strcmp(msg->topic, subscribe_topic_o_move) == 0 && game_mode == 1)
     {
         char payload[msg->payloadlen + 1];
@@ -195,7 +200,7 @@ void on_message(struct mosquitto *mosq, void *userdata, const struct mosquitto_m
             {
                 board[row][col] = 'O';
                 display_board();
-                current_player = 'X';
+                current_player = 'X'; // Switch back to human
                 waiting_for_esp32_response = 0;
             }
             else
@@ -204,7 +209,8 @@ void on_message(struct mosquitto *mosq, void *userdata, const struct mosquitto_m
                 printf("\033[K");
                 printf("Invalid AI move received.\n");
                 current_player = 'O';
-                char request_payload[1] = {'1'};
+                // Potentially trigger another AI move request if needed on ESP32
+                char request_payload[1] = {'1'}; // Or any non-empty payload
                 mosquitto_publish(mosq, NULL, "request_ai_move", strlen(request_payload), request_payload, 0, false);
             }
         }
@@ -215,17 +221,33 @@ void on_message(struct mosquitto *mosq, void *userdata, const struct mosquitto_m
             printf("Error parsing AI move.\n");
         }
     }
-    // handles player turn
     else if (strcmp(msg->topic, subscribe_topic_turn) == 0)
     {
         current_player = ((char *)msg->payload)[0];
-
+        // printf("DEBUG: Received turn update - current_player is now: %c\n", current_player);
         move_cursor(status_row + 2, 1);
         printf("\033[K");
         printf("Current turn: Player %c\n", current_player);
+
+        // Update UI based on turn status
+        if (game_mode == 2)
+        { // Two-player mode
+            if (current_player == my_player)
+            {
+                move_cursor(status_row + 3, 1);
+                printf("\033[K");
+                printf("It's your turn! Please make a move.\n");
+            }
+            else
+            {
+                move_cursor(status_row + 3, 1);
+                printf("\033[K");
+                printf("Waiting for other player's move...\n");
+            }
+        }
+
         waiting_for_esp32_response = 0;
     }
-    // handles status of wins and loss
     else if (strcmp(msg->topic, subscribe_topic_status) == 0)
     {
         char payload[msg->payloadlen + 1];
@@ -261,7 +283,6 @@ void on_message(struct mosquitto *mosq, void *userdata, const struct mosquitto_m
             fflush(stdout);
         }
     }
-    // handles AI vs BASH outcomes
     else if (strcmp(msg->topic, subscribe_topic_tournament_results) == 0)
     {
         move_cursor(status_row + 4, 1);
@@ -270,8 +291,21 @@ void on_message(struct mosquitto *mosq, void *userdata, const struct mosquitto_m
         move_cursor(status_row + 5, 1);
         printf("Press any key to return to menu...");
         getchar();
-        game_mode = 0;
+        game_mode = 0; // Go back to menu
         clear_screen();
+    }
+}
+
+void cleanup_bash_player()
+{
+    if (bash_player_pid > 0)
+    {
+        kill(bash_player_pid, SIGTERM);
+        waitpid(bash_player_pid, NULL, 0);
+        bash_player_pid = 0;
+        move_cursor(status_row + 3, 1);
+        printf("\033[K");
+        printf("Bash AI player terminated.\n");
     }
 }
 
@@ -279,14 +313,14 @@ int main()
 {
     clear_screen();
 
-    do
+    // Player selection for distributed mode
+    if (game_mode == 0)
     {
         move_cursor(1, 1);
-        printf("Tic-Tac-Toe Game Mode:\n");
-        printf("1. Single Player (vs. AI)\n");
-        printf("2. Two Player (Local)\n");
-        printf("3. Automated Tournament Mode\n");
-        printf("Enter your choice (1, 2, or 3): ");
+        printf("Tic-Tac-Toe Game:\n");
+        printf("1. Single Player OR vs. AI)\n");
+        printf("2. Two Player \n");
+        printf("Enter your choice (1 or 2): ");
 
         if (scanf("%d", &game_mode) != 1)
         {
@@ -296,11 +330,35 @@ int main()
         }
         while (getchar() != '\n')
             ;
-    } while (game_mode != 1 && game_mode != 2);
+
+        // For two-player mode, ask which player they want to be
+        if (game_mode == 2)
+        {
+            char player_choice;
+            move_cursor(5, 1);
+            printf("Which player do you want to be? (X/O): ");
+            player_choice = getchar();
+            while (getchar() != '\n')
+                ;
+
+            my_player = (player_choice == 'X' || player_choice == 'x') ? 'X' : 'O';
+
+            // Set unique client ID based on player choice
+            snprintf(mqtt_client_id, sizeof(mqtt_client_id), "tictactoe_player_%c_%d",
+                     my_player, (int)time(NULL));
+        }
+        else
+        {
+            // For single player mode
+            my_player = 'X'; // Always X in single player mode
+            snprintf(mqtt_client_id, sizeof(mqtt_client_id), "tictactoe_tui_x");
+        }
+    }
 
     move_cursor(1, 1);
     printf("\033[J");
 
+    // Initialize libmosquitto
     mosquitto_lib_init();
     mosq = mosquitto_new(mqtt_client_id, true, NULL);
     if (!mosq)
@@ -328,34 +386,34 @@ int main()
     move_cursor(1, 1);
     printf("\033[J");
 
-    // Publish the selected game mode to the ESP32
-    char game_mode_payload[2]; // Enough space for "1" or "2" and null terminator
-    snprintf(game_mode_payload, sizeof(game_mode_payload), "%d", game_mode);
-    mosquitto_publish(mosq, NULL, "game_mode", strlen(game_mode_payload), game_mode_payload, 0, false);
-
-    char game_mode_payload[20];
-    if (game_mode == 3)
+    // In two-player distributed mode, only one client should send the game mode
+    if (game_mode == 2 && my_player == 'X')
     {
-        int num_games = 5; // Default number of games
-        snprintf(game_mode_payload, sizeof(game_mode_payload), "AUTOMATED:%d", num_games);
-        mosquitto_publish(mosq, NULL, "game_mode", strlen(game_mode_payload), game_mode_payload, 0, false);
-        move_cursor(status_row, 1);
-        printf("\033[K");
-        printf("Automated Tournament Mode started (%d games). Waiting for results from ESP32...\n", num_games);
-    }
-    else
-    {
+        // X player initiates the game setup
+        char game_mode_payload[2];
         snprintf(game_mode_payload, sizeof(game_mode_payload), "%d", game_mode);
         mosquitto_publish(mosq, NULL, "game_mode", strlen(game_mode_payload), game_mode_payload, 0, false);
         move_cursor(status_row, 1);
         printf("\033[K");
-        printf("Game started in %s mode.\n", (game_mode == 1) ? "Single Player" : "Two Player");
+        printf("Game started in Two Player mode. You are Player %c.\n", my_player);
     }
-
-    reset_game();
-    display_board();
-    move_cursor(status_row, 1);
-    printf("\033[K");
+    else if (game_mode == 1)
+    {
+        // Single player mode
+        char game_mode_payload[2];
+        snprintf(game_mode_payload, sizeof(game_mode_payload), "%d", game_mode);
+        mosquitto_publish(mosq, NULL, "game_mode", strlen(game_mode_payload), game_mode_payload, 0, false);
+        move_cursor(status_row, 1);
+        printf("\033[K");
+        printf("Game started in Single Player mode.\n");
+    }
+    else if (game_mode == 2 && my_player == 'O')
+    {
+        // O player just joins
+        move_cursor(status_row, 1);
+        printf("\033[K");
+        printf("Joining Two Player game. You are Player %c.\n", my_player);
+    }
 
     reset_game();
     display_board();
@@ -373,9 +431,8 @@ int main()
     {
         move_cursor(prompt_row - 1, 1);
         printf("\033[K");
-        printf("Two Player Mode. Player 1 (X) goes first.\n");
-
-        current_player = 'X';
+        printf("Two Player Mode. You are Player %c.\n", my_player);
+        current_player = 'X'; // Game always starts with X
     }
 
     while (game_mode == 1 || game_mode == 2)
@@ -407,9 +464,21 @@ int main()
                 display_board();
                 move_cursor(status_row, 1);
                 printf("\033[K");
-                printf("New game started in %s mode.\n", (game_mode == 1) ? "Single Player" : "Two Player");
 
-                mosquitto_publish(mosq, NULL, "reset_game", 1, "1", 0, false);
+                if (game_mode == 2)
+                {
+                    printf("New game started in Two-Player mode. You are Player %c.\n", my_player);
+                }
+                else
+                {
+                    printf("New game started in Single Player mode.\n");
+                }
+
+                // Send reset message to ESP32 (only X player in two-player mode)
+                if (game_mode != 2 || my_player == 'X')
+                {
+                    mosquitto_publish(mosq, NULL, "reset_game", 1, "1", 0, false);
+                }
 
                 current_player = 'X';
                 game_over = 0;
@@ -421,7 +490,7 @@ int main()
         }
         else if (!waiting_for_esp32_response)
         {
-            // bash vs human player mode
+            // In single player mode (human is always X)
             if (game_mode == 1 && current_player == 'X')
             {
                 int move_index = -1;
@@ -445,27 +514,27 @@ int main()
                 snprintf(move_payload, sizeof(move_payload), "X:%d,%d", row, col);
                 mosquitto_publish(mosq, NULL, publish_topic_move, strlen(move_payload), move_payload, 0, false);
 
-                // Update display
+                // Update local display (will be overwritten by ESP32 update)
                 board[row][col] = 'X';
                 display_board();
 
+                // Set waiting flag
                 waiting_for_esp32_response = 1;
-                current_player = 'O'; // Switch to opponent
+                current_player = 'O'; // Switch to opponent tentatively
 
                 move_cursor(status_row + 2, 1);
                 printf("\033[K");
                 printf("Waiting for AI response...\n");
             }
-            // two human players mode
-            else if (game_mode == 2)
+            // In two-player mode, only allow moves when it's this player's turn
+            else if (game_mode == 2 && current_player == my_player)
             {
-
-                int player_num = (current_player == 'X') ? 1 : 2;
+                int player_num = (my_player == 'X') ? 1 : 2;
                 int move_index = -1;
 
                 move_cursor(prompt_row, 1);
                 printf("\033[K");
-                printf("Current player: %c\n", current_player);
+                printf("It's your turn (Player %c)\n", my_player);
 
                 do
                 {
@@ -482,29 +551,40 @@ int main()
                 int row = move_index / 3;
                 int col = move_index % 3;
 
-                // Send move to ESP32 based on current player
+                // Send move to ESP32 based on player
                 char move_payload[10];
-                snprintf(move_payload, sizeof(move_payload), "%c:%d,%d", current_player, row, col);
+                snprintf(move_payload, sizeof(move_payload), "%c:%d,%d", my_player, row, col);
 
-                const char *topic = (current_player == 'X') ? publish_topic_player1_move : publish_topic_player2_move;
+                const char *topic = (my_player == 'X') ? publish_topic_player1_move : publish_topic_player2_move;
 
                 mosquitto_publish(mosq, NULL, topic, strlen(move_payload), move_payload, 0, false);
 
-                // Update display
-                board[row][col] = current_player;
+                // Update local display (will be overwritten by ESP32 update)
+                board[row][col] = my_player;
                 display_board();
 
+                // Set waiting flag
                 waiting_for_esp32_response = 1;
-
-                current_player = (current_player == 'X') ? 'O' : 'X';
 
                 move_cursor(status_row + 2, 1);
                 printf("\033[K");
-                printf("Move sent to ESP32, waiting for confirmation...\n");
+                printf("Move sent, waiting for other player...\n");
+            }
+            else if (game_mode == 2 && current_player != my_player)
+            {
+                // It's not this player's turn in two-player mode
+                move_cursor(status_row + 3, 1);
+                printf("\033[K");
+                printf("Waiting for Player %c's move...\n", current_player);
+                usleep(500000); // Longer delay when waiting for other player
             }
         }
-        usleep(100000);
+
+        // Short delay to prevent CPU hogging
+        usleep(100000); // 100ms delay
     }
+
+    // Cleanup
     mosquitto_loop_stop(mosq, true);
     mosquitto_disconnect(mosq);
     mosquitto_destroy(mosq);
