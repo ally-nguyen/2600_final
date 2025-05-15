@@ -126,7 +126,7 @@ int get_move(int player, int prompt_row, int error_row)
     }
 }
 
-// subscribes to all the necessary topics
+// callback when connected to mqtt + subscribe to necessary topics
 void on_connect(struct mosquitto *mosq, void *userdata, int res)
 {
     if (res == MOSQ_ERR_SUCCESS)
@@ -155,7 +155,7 @@ void on_connect(struct mosquitto *mosq, void *userdata, int res)
     }
 }
 
-// handles processing communication from esp32 regarding player moves
+// callback and handles message received from esp32 regarding player moves
 void on_message(struct mosquitto *mosq, void *userdata, const struct mosquitto_message *msg)
 {
     // handle processing moves onto board
